@@ -1,0 +1,857 @@
+
+
+```{r, warning = FALSE}
+
+library(tidyverse)
+library(qqman)
+library(seqinr)
+
+```
+
+# Quality Control
+
+
+### Identification of individuals with elevated missing data rates or outlying heterozygosity rates
+
+We want to filter out all samples that has a high rate of missing data,
+since that can be due low DNA quality or concentration. Furthermore, we
+want to filter samples with either high or low heterozygosity rate. Low
+heterozygosity could be due to imbreeding and high heterozygosity could
+be due to contamiation of the sample. Both of these will bias the
+result.
+
+To identify missing data rates, we run the following command from the
+shell prompt:
+
+`plink --bfile eye_color --missing --allow-no-sex --out eyecolor`
+
+This will output a file "eyecolor-QC.imiss", where the number and
+proportion of missing SNPs can be found.
+
+To identify heterozygosity rate, we run the following command:
+
+`plink --bfile eye_color --het --allow-no-sex --out eyecolor`
+
+This will output a file "eyecolor-QC.het", where the number of
+homozygous genotypes (Hom), along with the number of non-missing
+genotypes per individual (NM), are specified. The observed
+heterozygosity rate per individual can then be calculated as:
+
+-   Het = (NM − Hom)/NM
+
+Now, in R, we make a combined dataframe with the missing SNPs and the
+heterozygosity rates.
+
+``` {r}
+
+d_miss <- read.table("eyecolor.imiss",header=T)
+d_het <- read.table("eyecolor.het",header=T)
+d <- inner_join(d_miss,d_het)
+
+d <- d %>% 
+    mutate(Het = (N.NM.-O.HOM.)/N.NM.)
+
+head(d)
+
+```
+
+```{r}
+
+ggplot(data = d) +
+    geom_point(aes(x = Het, y = F_MISS)) +
+    theme_classic() +
+    ylab("Missing call rate") +
+    xlab("Observed heterozygosity rate per individual")
+
+```
+
+
+From this plot it can be observed that the data comes from different
+chips. Due to this, we will not filter any data due to missing SNPs,
+since this will remove a large part of our dataset, which is not a
+result of missing SNPs. It might be an option to do this filtering
+before mixing the data, to be able to filter samples with low quality
+DNA and low DNA concentration, to avoid this bias. But since we don't
+know the origin of the datapoints, we cannot do this.
+
+We will filter the samples with a heterozygosity rate more than 3 SD
+from the mean. To do this, we make a table with all the individuals we
+want to filter out.
+
+``` {R}
+
+Het_mean  <- mean(d$Het)
+Het_SD  <- sd(d$Het)
+
+d2 <- d %>% 
+    filter(abs(Het-Het_mean) > 3*Het_SD)
+
+het_filter <- d2$FID
+
+d2
+
+```
+
+```{r}
+
+d %>% 
+    mutate(filt = abs(Het-Het_mean) > 3*Het_SD) %>% 
+    ggplot() +
+        geom_point(aes(x = Het, y = F_MISS, color = filt)) +
+        geom_vline(xintercept = Het_mean, color = "red", linetype = "dashed") +
+        geom_vline(xintercept = Het_mean-3*Het_SD, color = "blue", linetype = "dashed") +
+        geom_vline(xintercept = Het_mean+3*Het_SD, color = "blue", linetype = "dashed") +
+        ylab("Missing call rate") +
+        xlab("Observed heterozygosity rate per individual") +
+        theme_classic()
+
+```
+
+
+According to this, we should filter 13 individuals from the data, due to
+too low or too high heterozygosity rates.
+
+(REMEMBER: YOU COULD SPLIT THIS INTO 4 GROUPS, EACH FOR EACH CHIP, AND
+THEN FILTER FOR HETEROZYGOSITY RATES.)
+
+Now we make a file with the individuals we want to filter out.
+
+``` {R}
+
+d2 %>% select(FID, IID) %>% 
+    write.table(file = "wrong_het_missing_values.txt", sep = "\t",
+            row.names = FALSE, col.names = FALSE)
+
+```
+
+Now we can use the following PLINK command to remove those individuals
+from the data. You might want to cange --make-bed, so that you don't
+overwrite the original files.
+
+`plink --bfile eye_color --remove wrong_het_missing_values.txt --make-bed --allow-no-sex --out eyecolor-QC`
+
+After this filtering, 13 individuals were removed from the 1,287
+individuals, leaving 960,613 variants and 1,274 individuals for further
+filtering and quality control.
+
+### Identification of duplicated or related individuals
+
+#### A. Are there any closely related individuals in the sample? 
+
+We also want to filter related individuals, since they will increase the
+genotype frequency no matter what phenotype they have. This will result
+in a bias in the allele frequency distribution and eventually bias the
+case-control study. We therefore want to filter related individuals out
+of our dataset and to do this, we calculate an identity by descent (IBD)
+matrix. This can be done using PLINK, but it works best with
+non-correlated SNPs. Therefore, we prune the data such that no SNP pair
+has an $r^2$ value above some threshold. We do that using the following
+command:
+
+`plink --bfile eyecolor-QC --indep-pairwise 500kb 5 0.2 --allow-no-sex --out eyecolor-QC`
+
+This will output a file "eyecolor-QC.prune.in" with the independent
+SNPs. This file can now be used to calculate IBD between each pair of
+individuals. The following PLINK command is used:
+
+`plink --bfile eyecolor-QC --extract eyecolor-QC.prune.in --genome --min 0.185 --allow-no-sex --out eyecolor-QC`
+
+This will output a file "eyecolor-QC.genome". The calculated IBD will
+only be printet in this file if it is above 0.185 (mean value between
+second degree relatives (0.25), and third degree relatives (0.125)).
+PI_HAT shows how much of the genome two individuals share. 1 = identical
+twins, 0.5 = siblings, 0.25 = half-siblings/uncle/aunt, 0.125 = first
+cousins.
+
+``` {R}
+
+ibd <- read.table('eyecolor-QC.genome', header = TRUE)
+ibd
+
+```
+
+```{r}
+
+members <- ibd$FID1
+members <- unique(members)
+write.table(cbind(members,members), file = 'wrong_ibd.txt', col.names = F, row.names = F)
+members
+
+```
+
+
+Now, to remove these individuals, we use the following command:
+
+`plink --bfile eyecolor-QC --remove wrong_ibd.txt --make-bed --allow-no-sex --out eyecolor-QC`
+
+After the filtering, 14 individuals were removed from the data, which
+means that 960,613 variants and 1,260 individuals pass filters and QC.
+
+# SNP QC
+
+### Identification of SNPs with an excessive missing data rate
+
+We run the missing command again, since we have done some filtering.
+
+`plink --bfile eyecolor-QC --missing --allow-no-sex --out eyecolor-QC`
+
+``` {R}
+
+d_lmiss <- read.table("eyecolor-QC.lmiss", header = T)
+head(d_lmiss)
+
+```
+
+```{r, warning=FALSE}
+
+d_lmiss %>%
+    ggplot(aes(x=F_MISS)) +
+    geom_histogram(col = "black", fill = "cornflowerblue") +
+    xlab("Missing call rate") +
+    ylab("Count") +
+    theme_classic()
+
+```
+
+
+Here, again, we see a grouping of the different chips. We will not be
+doing any filtering. From now on, we will go on with the
+eyecolor_QC.bed/bim/fam files, since these are the files that has been
+subject to quality control.
+
+We use this command to filter away variants that deviate more from HW
+than $p<1 \cdot 10^{-5}$. I also filter minor allele frequence of less
+than 0.01 and at last we filter for a call rate of 25%, which means we filter for variants that have more than 75% missing data.
+
+`plink --bfile eyecolor-QC --geno 0.75 --hwe 0.00001 --maf 0.01 --make-bed --allow-no-sex --out eyecolor-QC`
+
+- 8,167 variants were removed due to missing genotype data (--geno) 
+- 24,523 variants were removed due to Hardy-Weinberg exact test (--hwe) 
+- 89,770 variants were removed due to minor allele threshold(s) variants from the data (--maf).
+
+In total 838,153 variants and 1,260 individuals pass filters and QC.
+
+This completes the data preprocessing.
+
+# Association testing using PLINK
+
+## Creating a binary phenotype
+
+Reading in the two data files:
+
+``` {r}
+
+eyecolor_qc <- read.table("eyecolor-QC.fam")
+colnames(eyecolor_qc) <- c("FID","IID","PAT","MAT","SEX","PHENO")
+knitr::kable(head(eyecolor_qc))
+
+```
+
+```{r}
+
+phenotype <- read.table("eye_color.txt") 
+colnames(phenotype) <- c("IID", "eyecolor")
+knitr::kable(head(phenotype))
+
+```
+
+
+Visualizing the data:
+
+``` {R}
+
+ggplot(phenotype) +
+    geom_bar(aes(x = eyecolor, fill = eyecolor), col = "black") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+          legend.position = "none") +
+    xlab("Eyecolor Phenotype") + ylab("Count") +
+    scale_fill_manual(values=c("goldenrod", "dodgerblue3", "cyan4", "lightskyblue", "paleturquoise4", "lightskyblue3", "tan4", "dodgerblue4", "darkorange4", "seagreen4", "darkseagreen4", "peru"))
+    
+```
+
+
+I make the binary phenotypes so that 1 is all phenotypes containing the
+word 'brown', and 2 is the leftover phenotypes (green, blue, gray).
+
+``` {R}
+
+phenotype$PHENO <- ifelse(grepl("brown", phenotype$eyecolor), 1 , 2) 
+phenotype$FID <- phenotype$IID
+knitr::kable(phenotype %>% head())
+
+```
+
+
+``` {R}
+
+write.table(phenotype, file = "binary_phenotypes.txt", sep = "\t", row.names = FALSE, col.names = FALSE)
+
+```
+
+I then match the binary phenotypes to the fam file
+
+``` {R}
+
+eyecolor_qc$PHENO <- phenotype$PHENO[match(eyecolor_qc$FID, phenotype$FID)]
+
+knitr::kable(head(eyecolor_qc))
+
+```
+
+```{r}
+
+knitr::kable(eyecolor_qc %>% group_by(PHENO) %>% summarise(count = n()))
+
+```
+
+
+As we can see, there are 646 individuals with brown phenotype and 614
+individuals with other phenotype
+
+## PCA
+
+It is best to do PCA on an LD-pruned set of SNPs. Therefore, we use the
+follwing command to prune the dataset:
+
+`plink --bfile eyecolor-QC --indep-pairwise 500kb 5 0.2 --allow-no-sex --out eyecolor-QC`
+
+This creates a ".prune.in" and a ".prune.out" file. Now, to use the
+pruned SNPs to calculate the first 20 PCs, we run this command:
+
+`plink --bfile eyecolor-QC --extract eyecolor-QC.prune.in --pca 20 --allow-no-sex --out eyecolor-QC`
+
+This calculates the eigenvalues and eigenvectors.
+
+``` {R}
+
+pca <- read.table("eyecolor-QC.eigenvec")
+colnames(pca) <- c(c("FID","IID"),paste(rep("PC",20),seq(1,20),sep=""))
+
+pca <- inner_join(eyecolor_qc, pca)
+knitr::kable(head(pca))
+
+```
+
+
+``` {R}
+
+pca %>% ggplot() +
+    geom_point(aes( x= PC1, y = PC2, color = factor(PHENO))) +
+    theme_classic() +
+    scale_color_manual(values=c("tan4", "deepskyblue3"), labels = c("Brown", "Non-brown")) +
+    guides(col=guide_legend("Binary Phenotype"))
+
+```
+
+
+## Fisher\'s Exact test
+
+To do the Fisher's exact test, we type the following command:
+
+`plink --bfile eyecolor-QC --assoc fisher --allow-no-sex --pheno binary_phenotypes.txt --out eyecolor`
+
+This produces an "eyecolor.assoc.fisher" output file, with the
+following:
+
+``` {R}
+
+fisher <- read.table("eyecolor.assoc.fisher", header = T)
+
+fisher <- fisher[order(fisher$P),]
+
+knitr::kable(fisher %>% head(n = 10))
+
+```
+
+```{r}
+
+knitr::kable(fisher %>%
+filter(P <= 5e-8) %>%
+summarise(n = n()))
+
+```
+
+
+After the Fisher\'s exact test, 749 SNPs are significant.
+
+I then make a QQ-plot:
+
+``` {R}
+
+qq(fisher$P, main = "QQ plot of unadjusted GWAS p-values")
+
+```
+
+
+I then try to adjust the p-values using Bonferroni correction to see if
+the significant loci are still significant when they have been adjusted.
+
+``` {R}
+
+fisher$bonf <- p.adjust(fisher$P, method = "bonferroni", n = nrow(fisher))
+
+knitr::kable(fisher %>% head(n = 10))
+
+```
+
+```{r}
+
+knitr::kable(fisher %>%
+filter(bonf <= 5e-8) %>%
+summarise(n = n()))
+
+```
+
+
+After Bonferroni correction, there are only 42 significant loci. But the
+ten most significant loci are still the same.
+
+``` {R}
+
+qq(fisher$bonf, main = "QQ plot of Bonferroni adjusted GWAS p-values")
+
+```
+
+
+There are no longer as many significant SNPs, however the data still
+seems inflated. This can be corrected in two ways: Either doing genomic
+control or adjusting for PCs.
+
+## Genomic control
+
+The inflation factor (𝝺) can be calculated as the median of the
+Chi-squared statistics computed divided by the median of the Chi-squared
+distribution under the null. Given a p-value (p) the corresponding
+Chi-squared quantile can be calculated as:
+
+qchisq(p, df=1, lower.tail = F)
+
+To do genomic control (to adjust for inflated test statistic) you divide
+the Chi-squared values by the inflation factor. To turn a Chi-squared
+quantile (q) into a p-value you use the "pchisq" function:
+
+pchisq(q, df=1, lower.tail = F)
+
+First we calculate the median of the chi-squared distribution under the
+null:
+
+``` {R}
+
+set.seed(0)
+exp_med <- median(rchisq(10000000,1))
+exp_med
+
+```
+
+
+Then we calculate the observed chi-squared statistics:
+
+``` {R}
+
+fisher <- fisher %>% mutate(obs_qchisq = qchisq(P, df=1, lower.tail = F))
+knitr::kable(head(fisher))
+
+```
+
+
+The we calculate the inflation factor:
+
+``` {R}
+
+lambda <- median(fisher$obs_qchisq)/exp_med
+lambda
+
+```
+
+
+At last we calculate the corrected p-values using the inflation factor
+and make a QQ-plot again with the inflation corrected p-values:
+
+``` {R}
+
+fisher <- fisher %>% 
+mutate(corrected_qchisq = obs_qchisq/lambda) %>%
+mutate(corrected_p = pchisq(corrected_qchisq, df=1, lower.tail = F))
+knitr::kable(head(fisher))
+
+```
+
+```{r}
+
+qq(fisher$corrected_p, main = "QQ plot of inflation corrected GWAS p-values")
+
+```
+
+
+As we can see from the QQ-plot above, using genomic control to correct
+for inflation did help a bit on the inflation.
+
+## Adjusting for PCs
+
+In order to know how many PCs we have to adjust for, I first calculate
+how much variance that is explained by each PC.
+
+``` {R}
+
+eigenval <- read.table("eyecolor-QC.eigenval", header = F)
+
+eigenval <- eigenval %>% 
+    mutate(variance_expl = V1/sum(V1)*100) %>% 
+    mutate(PC = seq(1,20)) %>% 
+    mutate(cumsum = cumsum(variance_expl)) 
+
+knitr::kable(head(eigenval))
+
+```
+
+```{r}
+
+eigenval %>% 
+    ggplot() +
+        geom_line(aes(x = PC, y = cumsum)) +
+        geom_point(aes(x = PC, y = cumsum)) +
+        ylim(0,100) +
+        theme_classic()
+
+```
+
+
+From the above, we see that the two first PCs explain over 50% of the
+variance. Therefore, we only need to adjust for these two.
+
+We can use logistic regression test to perform an association test while
+correcting for covariates. To include the first 2 PCs as a covariate we
+type:
+
+`plink --bfile eyecolor-QC --pheno binary_phenotypes.txt --allow-no-sex --logistic --covar eyecolor-QC.eigenvec --covar-number 1-2`
+
+The output file plink.assoc.logistic contains p-values for both the SNPs
+and the covariates.
+
+``` {R}
+
+logistic <- read.table("plink.assoc.logistic", header = T)
+
+logistic <- logistic %>% 
+    filter(TEST == "ADD") %>% 
+    filter(!(is.na(P))) %>% 
+    arrange(P)
+
+knitr::kable(head(logistic))
+
+```
+
+
+``` {R}
+
+qq(logistic$P, main = "QQ plot of PCA corrected GWAS p-values")
+
+```
+
+
+I once again calculate the inflation factor to see if it has improved
+(i.e., if it is closer to 1).
+
+``` {R}
+
+logistic <- logistic %>% 
+    mutate(obs_q = qchisq(P, df=1, lower.tail = F))
+
+lambda <- median(logistic$obs_q)/exp_med
+lambda
+
+```
+
+
+As we can see both from the QQ plot and the inflation factor, the PCA
+correction is effective and therefore this is what I am going to be
+using when making the manhattan plot.
+
+``` {R}
+
+manhattan(logistic, main = "Manhattan plot of PCA corrected GWAS p-values", annotatePval = 5e-8)
+
+```
+
+
+If we use a significance threshold of 5e-8 (the red line in the
+manhattan plot), we get the following significant SNPs:
+
+``` {R}
+
+significant <- logistic %>%
+    filter(P<=5e-8) %>%
+    arrange(P)
+
+knitr::kable(significant)
+
+```
+
+
+27 SNPs are significant after PCA correction using a threshold of 5e-8.
+All 27 SNPs are found on Chr 15.
+
+# Zooming in on the SNPs at the most significant loci
+
+I use this funtion to compute the genotypes for the SNPs, with a window
+around 200 kb:
+
+`plink --bfile eyecolor-QC --pheno binary_phenotypes.txt --allow-no-sex --recode A --snp rs1667394 --window 200 --out SNP`
+
+``` {R}
+
+genotypes <- read.table("SNP.raw", header = T)
+
+genotypes$PHENO <- eyecolor_qc$PHENO
+genotypes$PHENO <- ifelse(genotypes$PHENO == 1, "brown", "non-brown")
+
+knitr::kable(head(genotypes))
+
+```
+
+
+``` {R}
+
+eye_col <- phenotype %>% 
+    filter(!(IID %in% members)) %>%
+    filter(!(IID %in% het_filter))
+
+most_sig <- genotypes %>% 
+    select(matches('rs1667394')) %>% 
+    mutate(response = factor(eye_col$PHENO)) %>% 
+    mutate(eye_col = eye_col$eyecolor)  %>% 
+    drop_na()
+
+knitr::kable(head(most_sig))
+
+```
+
+```{r}
+
+ggplot(data = most_sig, aes(x = rs1667394_C, y = ..count..)) +
+    geom_bar(aes(fill = response), col = "black", position = "dodge") +
+    ggtitle('Most significant SNP (rs1667394)') +
+    xlab("Number of minor alleles") +
+    scale_fill_manual(values = c("tan4", "deepskyblue3"), labels = c("Brown", "Non-brown"), name = "Eye color") +
+    theme_classic()
+
+```
+
+
+Here we can see that genotype 00 can result in both the brown and
+non-brown phenotype but mostly non-brown. Same with genotype 01 which
+mostly result in brown phenotype. However, genotype 11 almost only
+result in brown phenotype.
+
+-   Dominant: 'AA + AB' versus 'BB'
+-   Recessive: 'AA' versus 'AB + BB'
+-   Additive: 'AA' versus 'AB' versus 'BB'
+
+Here we see a plot of the most significant SNP (rs1667394) and the
+number of minor alleles (i.e., the number of derived alleles) for each
+individual for each phenotype.
+
+``` {R}
+
+group <- most_sig %>% 
+    group_by(rs1667394_C, response, eye_col) %>% 
+    summarise(n = n())
+
+colors <- c("blue"= "deepskyblue3", 
+            "blue-green" = "cyan4",
+            "blue-green-gold" = "lightskyblue",
+            "blue-green-grey" = "paleturquoise4",
+            "blue-grey" = "lightskyblue3",
+            "dark_blue" = "dodgerblue4",
+            "green" = "seagreen4",
+            "green-gray" = "darkseagreen4",
+            "brown" = "tan4",
+            "dark_brown" = "darkorange4",
+            "hazel/brown-green" = "peru",
+            "amber-brown" = "goldenrod")
+
+levels(colors) <- c("dark_blue", "blue", "blue-green-gold", "blue-green-grey", 
+                   "blue-grey", "blue-green", "green", "green-gray", "brown", 
+                   "dark_brown", "amber-brown", "hazel/brown-green")
+
+ggplot(data = group, aes(x = response, y = n, fill = eye_col)) +
+    geom_bar(stat="identity", col = "black") +
+    labs(title = 'rs1667394', y = "Number of individuals", x = "Phenotype") +
+    facet_wrap(~ rs1667394_C, scales = "free_x") +
+    scale_fill_manual(values = colors, name = "Eye color") +
+    scale_x_discrete(labels = c("Brown", "Non-brown")) +
+    theme_classic()
+
+```
+
+``` {R}
+
+data_long <- tidyr::gather(genotypes, key = variable, value = value, -c(FID, IID, PAT, MAT, SEX, PHENOTYPE, PHENO)) %>% 
+    drop_na()
+
+ggplot(data_long, aes(x = factor(value), fill = factor(PHENOTYPE))) +
+    geom_bar(position = "dodge", col = "black") + 
+    facet_wrap(~ variable, scales = "free_x", nrow = 3) +
+    xlab("Number of minor alleles") +
+    ylab("Number of individuals") +
+    theme_classic() +
+    scale_fill_manual(values = c("tan4", "deepskyblue3"), labels = c("Brown", "Non-brown"), name = "Eye color")
+
+```
+
+
+``` {R}
+
+significant$GENE <-c("HERC2", "HERC2", "HERC2", "OCA2", "HERC2", "HERC2", "OCA2", "HERC2", "OCA2", "OCA2", "HERC2", "OCA2", "OCA2", "OCA2", "OCA2", "HERC2", "HERC2", "OCA2", "OCA2", "OCA2", "OCA2", "HERC2", "HERC2", "HERC2", "OCA2", "OCA2", "OCA2")
+knitr::kable(head(significant))
+
+```
+
+
+```{r}
+
+significant %>%
+    ggplot() +
+    geom_histogram(aes(x=factor(GENE)), stat = "count", col = "black", fill = "cornflowerblue") +
+    theme_classic() +
+    xlab("Nearest gene") +
+    ylab("Number of SNPs")
+
+```
+
+# Replication of paper SNPs
+
+```{r}
+
+article_genes <- read.table("article_genes.csv", sep = ";", header = T)
+knitr::kable(head(article_genes))
+
+```
+
+```{r}
+
+chromosomes <- tibble(Chr = 15,
+                      size = c(102531392))
+
+OCA2 <- tibble(Chr = 15,
+               start = 28000021,
+               end = 28344461,
+               name = "OCA2")
+
+HERC2 <- tibble(Chr = 15, 
+                start = 28356186,
+                end = 28567325, 
+                name = "HERC2")
+
+```
+
+First, I try to identify SNPs which are directly found in the article.
+
+```{r}
+
+article_SNPs <- as.vector(article_genes$RS)
+
+identical <- significant %>% 
+    filter(SNP %in% article_SNPs) 
+
+knitr::kable(identical)
+
+```
+
+```{r}
+
+p <- ggplot() +
+    geom_segment(data = chromosomes, aes(x = factor(Chr), xend = factor(Chr), y = 27900000, yend = 28750000), color = "lightgrey", size = 20) +
+    geom_segment(data = OCA2, aes(x = factor(Chr), xend = factor(Chr), y = start, yend = end), color = "yellow4", alpha = 0.2, size = 10) +
+    geom_segment(data = HERC2, aes(x = factor(Chr), xend = factor(Chr), y = start, yend = end), color = "deepskyblue", alpha = 0.2, size = 10) +
+    annotate("text", label =HERC2$name, x =factor(HERC2$Chr), y = HERC2$end-100000, size = 5, colour= "red") +
+    annotate("text", label =OCA2$name, x =factor(OCA2$Chr), y = OCA2$end-160000, size = 5, colour= "red") +
+    theme_classic() +
+    coord_flip() +
+    xlab("Chromosome") +
+    ylab("BP")
+    
+
+p + geom_segment(data = identical, aes(x = factor(CHR), xend = factor(CHR), y = BP, yend = BP+2000), color = "black", size = 10)
+
+```
+
+Now I want to try to investigate if any of the SNPs i've found, is in close proximity to the ones in the article.
+
+```{r}
+
+find_close_genes <- function(x_away){
+    
+    sign_SNPs <- significant %>% 
+        mutate(ref_closest = NA,
+               ref_pos = NA,
+               ref_Nearest.Gene = NA,
+               ref_P = NA)
+
+    gene_pos <- tibble(Pos = article_genes$Pos,
+                       Chr = article_genes$Chr,
+                       RS = article_genes$RS,
+                       Nearest.Gene = article_genes$Nearest.Gene,
+                       P = article_genes$P)
+
+    for (i in 1:nrow(sign_SNPs)) {
+    
+        pos <- sign_SNPs$BP[i]
+        chr <- sign_SNPs$CHR[i]
+        test <- gene_pos$Chr == chr & gene_pos$Pos-x_away <= pos & pos <= gene_pos$Pos+x_away
+    
+        close_rs <- gene_pos$RS[which(test)]
+        ref_pos <- gene_pos$Pos[which(test)]
+        gene <- gene_pos$Nearest.Gene[which(test)]
+        p_val <- gene_pos$P[which(test)]
+    
+        sign_SNPs$ref_closest[i] <- list(close_rs)
+        sign_SNPs$ref_pos[i] <- unique(ref_pos)[1]
+        sign_SNPs$ref_Nearest.Gene[i] <- list(unique(gene))
+        sign_SNPs$ref_P[i] <- list(unique(p_val))
+    
+    }
+    
+    sign_SNPs <- sign_SNPs %>% 
+        drop_na()
+    
+    return(sign_SNPs)
+}
+
+```
+
+#### First I look at the 1,000 kb closest 
+
+```{r}
+
+bp_1000 <- find_close_genes(1000)
+knitr::kable(head(bp_1000))
+
+```
+
+```{r}
+
+p + geom_segment(data = bp_1000, aes(x = factor(CHR), xend = factor(CHR), y = BP, yend = BP+1000), color = "black", size = 10) + geom_segment(data = bp_1000, aes(x = factor(CHR), xend = factor(CHR), y = ref_pos, yend = ref_pos+1000), color = "red", size = 10)
+
+```
+
+#### Then I look at the 10,000 kb closest 
+
+```{r}
+
+bp_10000 <- find_close_genes(10000)
+knitr::kable(head(bp_10000))
+
+```
+
+
+```{r}
+
+p + 
+    geom_segment(data = bp_10000, aes(x = factor(CHR), xend = factor(CHR), y = BP, yend = BP+1000), color = "black", size = 10) +
+    geom_segment(data = bp_10000, aes(x = factor(CHR), xend = factor(CHR), y = ref_pos, yend = ref_pos+1000), color = "red", size = 10)
+
+```
+
+
